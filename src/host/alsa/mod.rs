@@ -16,7 +16,6 @@ use std::thread::{self, JoinHandle};
 use std::vec::IntoIter as VecIntoIter;
 use traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use self::alsa::Output;
 pub use self::enumerate::{default_input_device, default_output_device, Devices};
 
 pub type SupportedInputConfigs = VecIntoIter<SupportedStreamConfigRange>;
