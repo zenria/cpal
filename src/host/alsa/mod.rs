@@ -16,7 +16,9 @@ use std::thread::{self, JoinHandle};
 use std::vec::IntoIter as VecIntoIter;
 use traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use self::alsa::Output;
 pub use self::enumerate::{default_input_device, default_output_device, Devices};
+use std::time::Duration;
 
 pub type SupportedInputConfigs = VecIntoIter<SupportedStreamConfigRange>;
 pub type SupportedOutputConfigs = VecIntoIter<SupportedStreamConfigRange>;
@@ -513,7 +515,6 @@ fn input_stream_worker(
             }
             PollDescriptorsFlow::Return => return,
             PollDescriptorsFlow::Ready {
-                status,
                 avail_frames: _,
                 delay_frames,
                 stream_type,
@@ -523,13 +524,7 @@ fn input_stream_worker(
                     StreamType::Input,
                     "expected input stream, but polling descriptors indicated output",
                 );
-                let res = process_input(
-                    stream,
-                    &mut ctxt.buffer,
-                    status,
-                    delay_frames,
-                    data_callback,
-                );
+                let res = process_input(stream, &mut ctxt.buffer, delay_frames, data_callback);
                 report_error(res, error_callback);
             }
         }
@@ -552,7 +547,6 @@ fn output_stream_worker(
 
         match flow {
             PollDescriptorsFlow::Continue => {
-                report_error(stream.channel.prepare(), error_callback);
                 continue;
             }
             PollDescriptorsFlow::XRun => {
@@ -561,7 +555,6 @@ fn output_stream_worker(
             }
             PollDescriptorsFlow::Return => return,
             PollDescriptorsFlow::Ready {
-                status,
                 avail_frames,
                 delay_frames,
                 stream_type,
@@ -574,7 +567,6 @@ fn output_stream_worker(
                 let res = process_output(
                     stream,
                     &mut ctxt.buffer,
-                    status,
                     avail_frames,
                     delay_frames,
                     data_callback,
@@ -596,7 +588,8 @@ where
     match result {
         Ok(val) => Some(val),
         Err(err) => {
-            error_callback(err.into());
+            let e: StreamError = err.into();
+            error_callback(e);
             None
         }
     }
@@ -607,7 +600,6 @@ enum PollDescriptorsFlow {
     Return,
     Ready {
         stream_type: StreamType,
-        status: alsa::pcm::Status,
         avail_frames: usize,
         delay_frames: usize,
     },
@@ -663,20 +655,22 @@ fn poll_descriptors_and_prepare_buffer(
     let stream_type = match stream.channel.revents(&descriptors[1..])? {
         alsa::poll::Flags::OUT => StreamType::Output,
         alsa::poll::Flags::IN => StreamType::Input,
-        _ => {
+        other => {
             // Nothing to process, poll again
             return Ok(PollDescriptorsFlow::Continue);
         }
     };
 
-    let status = stream.channel.status()?;
-    let avail_frames = match stream.channel.avail() {
+    let (avail_frames, delay_frames) = match stream.channel.avail_delay() {
         Err(err) if err.errno() == Some(nix::errno::Errno::EPIPE) => {
             return Ok(PollDescriptorsFlow::XRun)
         }
         res => res,
-    }? as usize;
-    let delay_frames = match status.get_delay() {
+    }?;
+
+    let avail_frames = avail_frames as usize;
+
+    let delay_frames = match delay_frames {
         // Buffer underrun. TODO: Notify the user.
         d if d < 0 => 0,
         d => d as usize,
@@ -694,7 +688,6 @@ fn poll_descriptors_and_prepare_buffer(
 
     Ok(PollDescriptorsFlow::Ready {
         stream_type,
-        status,
         avail_frames,
         delay_frames,
     })
@@ -704,7 +697,6 @@ fn poll_descriptors_and_prepare_buffer(
 fn process_input(
     stream: &StreamInner,
     buffer: &mut [u8],
-    status: alsa::pcm::Status,
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static),
 ) -> Result<(), BackendSpecificError> {
@@ -713,7 +705,7 @@ fn process_input(
     let data = buffer.as_mut_ptr() as *mut ();
     let len = buffer.len() / sample_format.sample_size();
     let data = unsafe { Data::from_parts(data, len, sample_format) };
-    let callback = stream_timestamp(&status, stream.creation_instant)?;
+    let callback = stream_timestamp(stream, stream.creation_instant)?;
     let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
     let capture = callback
         .sub(delay_duration)
@@ -731,19 +723,19 @@ fn process_input(
 fn process_output(
     stream: &StreamInner,
     buffer: &mut [u8],
-    status: alsa::pcm::Status,
     available_frames: usize,
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static),
     error_callback: &mut dyn FnMut(StreamError),
 ) -> Result<(), BackendSpecificError> {
     {
+        //let status = stream.channel.status()?;
         // We're now sure that we're ready to write data.
         let sample_format = stream.sample_format;
         let data = buffer.as_mut_ptr() as *mut ();
         let len = buffer.len() / sample_format.sample_size();
         let mut data = unsafe { Data::from_parts(data, len, sample_format) };
-        let callback = stream_timestamp(&status, stream.creation_instant)?;
+        let callback = stream_timestamp(stream, stream.creation_instant)?;
         let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
         let playback = callback
             .add(delay_duration)
@@ -784,11 +776,12 @@ fn process_output(
 //
 // This ensures positive values that are compatible with our `StreamInstant` representation.
 fn stream_timestamp(
-    status: &alsa::pcm::Status,
+    stream: &StreamInner,
     creation_instant: Option<std::time::Instant>,
 ) -> Result<crate::StreamInstant, BackendSpecificError> {
     match creation_instant {
         None => {
+            let status = stream.channel.status()?;
             let trigger_ts = status.get_trigger_htstamp();
             let ts = status.get_htstamp();
             let nanos = timespec_diff_nanos(ts, trigger_ts)
