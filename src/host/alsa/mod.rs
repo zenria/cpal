@@ -639,7 +639,7 @@ fn poll_descriptors_and_prepare_buffer(
     let stream_type = match stream.channel.revents(&descriptors[1..])? {
         alsa::poll::Flags::OUT => StreamType::Output,
         alsa::poll::Flags::IN => StreamType::Input,
-        _other => {
+        _ => {
             // Nothing to process, poll again
             return Ok(PollDescriptorsFlow::Continue);
         }
