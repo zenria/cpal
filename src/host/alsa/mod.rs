@@ -18,7 +18,6 @@ use traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use self::alsa::Output;
 pub use self::enumerate::{default_input_device, default_output_device, Devices};
-use std::time::Duration;
 
 pub type SupportedInputConfigs = VecIntoIter<SupportedStreamConfigRange>;
 pub type SupportedOutputConfigs = VecIntoIter<SupportedStreamConfigRange>;
@@ -206,13 +205,7 @@ impl Device {
             num_descriptors
         };
 
-        // Check to see if we can retrieve valid timestamps from the device.
-        // Related: https://bugs.freedesktop.org/show_bug.cgi?id=88503
-        let ts = handle.status()?.get_htstamp();
-        let creation_instant = match (ts.tv_sec, ts.tv_nsec) {
-            (0, 0) => Some(std::time::Instant::now()),
-            _ => None,
-        };
+        let creation_instant = std::time::Instant::now();
 
         handle.start()?;
 
@@ -453,15 +446,7 @@ struct StreamInner {
     // TODO: We need an API to expose this. See #197, #284.
     can_pause: bool,
 
-    // In the case that the device does not return valid timestamps via `get_htstamp`, this field
-    // will be `Some` and will contain an `Instant` representing the moment the stream was created.
-    //
-    // If this field is `Some`, then the stream will use the duration since this instant as a
-    // source for timestamps.
-    //
-    // If this field is `None` then the elapsed duration between `get_trigger_htstamp` and
-    // `get_htstamp` is used.
-    creation_instant: Option<std::time::Instant>,
+    creation_instant: std::time::Instant,
 }
 
 // Assume that the ALSA library is built with thread safe option.
@@ -655,7 +640,7 @@ fn poll_descriptors_and_prepare_buffer(
     let stream_type = match stream.channel.revents(&descriptors[1..])? {
         alsa::poll::Flags::OUT => StreamType::Output,
         alsa::poll::Flags::IN => StreamType::Input,
-        other => {
+        _other => {
             // Nothing to process, poll again
             return Ok(PollDescriptorsFlow::Continue);
         }
@@ -705,7 +690,7 @@ fn process_input(
     let data = buffer.as_mut_ptr() as *mut ();
     let len = buffer.len() / sample_format.sample_size();
     let data = unsafe { Data::from_parts(data, len, sample_format) };
-    let callback = stream_timestamp(stream, stream.creation_instant)?;
+    let callback = stream_timestamp(stream.creation_instant);
     let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
     let capture = callback
         .sub(delay_duration)
@@ -729,13 +714,12 @@ fn process_output(
     error_callback: &mut dyn FnMut(StreamError),
 ) -> Result<(), BackendSpecificError> {
     {
-        //let status = stream.channel.status()?;
         // We're now sure that we're ready to write data.
         let sample_format = stream.sample_format;
         let data = buffer.as_mut_ptr() as *mut ();
         let len = buffer.len() / sample_format.sample_size();
         let mut data = unsafe { Data::from_parts(data, len, sample_format) };
-        let callback = stream_timestamp(stream, stream.creation_instant)?;
+        let callback = stream_timestamp(stream.creation_instant);
         let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
         let playback = callback
             .add(delay_duration)
@@ -775,45 +759,11 @@ fn process_output(
 // Use the elapsed duration since the start of the stream.
 //
 // This ensures positive values that are compatible with our `StreamInstant` representation.
-fn stream_timestamp(
-    stream: &StreamInner,
-    creation_instant: Option<std::time::Instant>,
-) -> Result<crate::StreamInstant, BackendSpecificError> {
-    match creation_instant {
-        None => {
-            let status = stream.channel.status()?;
-            let trigger_ts = status.get_trigger_htstamp();
-            let ts = status.get_htstamp();
-            let nanos = timespec_diff_nanos(ts, trigger_ts)
-                .try_into()
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "get_htstamp `{:?}` was earlier than get_trigger_htstamp `{:?}`",
-                        ts, trigger_ts
-                    );
-                });
-            Ok(crate::StreamInstant::from_nanos(nanos))
-        }
-        Some(creation) => {
-            let now = std::time::Instant::now();
-            let duration = now.duration_since(creation);
-            let instant = crate::StreamInstant::from_nanos_i128(duration.as_nanos() as i128)
-                .expect("stream duration has exceeded `StreamInstant` representation");
-            Ok(instant)
-        }
-    }
-}
-
-// Adapted from `timestamp2ns` here:
-// https://fossies.org/linux/alsa-lib/test/audio_time.c
-fn timespec_to_nanos(ts: libc::timespec) -> i64 {
-    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
-}
-
-// Adapted from `timediff` here:
-// https://fossies.org/linux/alsa-lib/test/audio_time.c
-fn timespec_diff_nanos(a: libc::timespec, b: libc::timespec) -> i64 {
-    timespec_to_nanos(a) - timespec_to_nanos(b)
+fn stream_timestamp(creation: std::time::Instant) -> crate::StreamInstant {
+    let now = std::time::Instant::now();
+    let duration = now.duration_since(creation);
+    crate::StreamInstant::from_nanos_i128(duration.as_nanos() as i128)
+        .expect("stream duration has exceeded `StreamInstant` representation")
 }
 
 // Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
